@@ -263,7 +263,7 @@ const reviewList = $('#review-list');
 const scoreTableBody = $('#score-table-body');
 const emptyScores = $('#empty-scores');
 const exportBtn = $('#export-btn');
-const clearBtn = $('#clear-btn');
+
 
 let playerName = '';
 let currentIndex = 0;
@@ -298,10 +298,12 @@ function startQuiz(name) {
   renderQuestion(); window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-function finishQuiz() {
+async function finishQuiz() {
   const correct = questions.reduce((sum, q, i) => sum + (answers[i] === q.answer ? 1 : 0), 0);
   const score = correct * 5; const accuracy = Math.round((correct / questions.length) * 100);
-  saveScore({ name: playerName, score, correct, total: questions.length, createdAt: new Date().toISOString() });
+  nextBtn.disabled = true;
+  nextBtn.textContent = '저장 중...';
+  const saved = await saveScore({ name: playerName, score, correct, total: questions.length });
   $('#result-name').textContent = playerName; $('#result-score').textContent = score; $('#correct-count').textContent = correct;
   $('#wrong-count').textContent = questions.length - correct; $('#accuracy').textContent = `${accuracy}%`;
   $('.score-ring').style.setProperty('--score-deg', `${score * 3.6}deg`);
@@ -310,7 +312,8 @@ function finishQuiz() {
   else if (score >= 80) { resultEmoji.textContent = '🔥'; message.textContent = '세부 메모와 동선까지 거의 정확합니다.'; }
   else if (score >= 60) { resultEmoji.textContent = '🌴'; message.textContent = '기본 일정은 충분합니다. 순서 문제만 다시 확인하세요.'; }
   else { resultEmoji.textContent = '🗺️'; message.textContent = '2탄은 어렵습니다. 해설로 세부 동선을 복습하세요.'; }
-  quizScreen.classList.add('hidden'); resultScreen.classList.remove('hidden'); renderReview(); renderScores(); window.scrollTo({ top: 0, behavior: 'smooth' });
+  if (!saved) message.textContent += ' 다만 공용 순위표 저장에 실패했습니다.';
+  quizScreen.classList.add('hidden'); resultScreen.classList.remove('hidden'); renderReview(); await renderScores(); window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
 function renderReview() {
@@ -323,31 +326,89 @@ function renderReview() {
   });
 }
 
-function getScores() { try { return JSON.parse(localStorage.getItem('nhaTrangQuiz2Scores') || '[]'); } catch { return []; } }
-function saveScore(score) { const scores = getScores(); scores.push(score); localStorage.setItem('nhaTrangQuiz2Scores', JSON.stringify(scores)); }
-function renderScores() {
-  const scores = getScores().sort((a, b) => b.score - a.score || new Date(a.createdAt) - new Date(b.createdAt));
-  scoreTableBody.innerHTML = ''; emptyScores.classList.toggle('hidden', scores.length > 0);
-  scores.forEach((s, index) => {
-    const row = document.createElement('tr');
-    const date = new Date(s.createdAt).toLocaleString('ko-KR', { year:'2-digit', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
-    const medal = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : index + 1;
-    row.innerHTML = `<td><span class="rank-badge">${medal}</span></td><td>${escapeHtml(s.name)}</td><td>${s.score}점</td><td>${s.correct}/${s.total}</td><td>${date}</td>`;
-    scoreTableBody.appendChild(row);
+const SUPABASE_URL = 'https://ahdzioosokzyskhxibai.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_uAPybrzg3LGpxLfEvNjGrQ_YiudSXrE';
+const SCORE_API = `${SUPABASE_URL}/rest/v1/quiz_scores`;
+const QUIZ_VERSION = 'nha-trang-quiz-2';
+let cachedScores = [];
+
+async function supabaseRequest(path = '', options = {}) {
+  const response = await fetch(`${SCORE_API}${path}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+      ...(options.headers || {})
+    }
   });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(`Supabase ${response.status}: ${detail}`);
+  }
+  if (response.status === 204) return null;
+  return response.json();
+}
+
+async function getScores() {
+  const query = `?select=name,score,correct_count,total_questions,created_at&quiz_version=eq.${encodeURIComponent(QUIZ_VERSION)}&order=score.desc,created_at.asc&limit=200`;
+  cachedScores = await supabaseRequest(query, { method: 'GET', headers: { Prefer: 'return=representation' } });
+  return cachedScores;
+}
+
+async function saveScore(score) {
+  try {
+    await supabaseRequest('', {
+      method: 'POST',
+      body: JSON.stringify({
+        quiz_version: QUIZ_VERSION,
+        name: score.name.trim(),
+        score: score.score,
+        correct_count: score.correct,
+        total_questions: score.total
+      })
+    });
+    return true;
+  } catch (error) {
+    console.error(error);
+    alert('공용 점수 저장에 실패했습니다. Supabase 테이블 설정을 확인해 주세요.');
+    return false;
+  }
+}
+
+async function renderScores() {
+  scoreTableBody.innerHTML = '<tr><td colspan="5">순위표 불러오는 중...</td></tr>';
+  emptyScores.classList.add('hidden');
+  try {
+    const scores = await getScores();
+    scoreTableBody.innerHTML = '';
+    emptyScores.classList.toggle('hidden', scores.length > 0);
+    scores.forEach((s, index) => {
+      const row = document.createElement('tr');
+      const date = new Date(s.created_at).toLocaleString('ko-KR', { year:'2-digit', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
+      const medal = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : index + 1;
+      row.innerHTML = `<td><span class="rank-badge">${medal}</span></td><td>${escapeHtml(s.name)}</td><td>${s.score}점</td><td>${s.correct_count}/${s.total_questions}</td><td>${date}</td>`;
+      scoreTableBody.appendChild(row);
+    });
+  } catch (error) {
+    console.error(error);
+    scoreTableBody.innerHTML = '<tr><td colspan="5">공용 순위표를 불러오지 못했습니다.</td></tr>';
+  }
 }
 function escapeHtml(str) { return String(str).replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#039;','"':'&quot;'}[ch])); }
-function exportCsv() {
-  const scores = getScores(); if (!scores.length) return alert('저장할 기록이 없습니다.');
-  const rows = [['이름','점수','정답수','총문제수','응시일시'], ...scores.map(s => [s.name, s.score, s.correct, s.total, new Date(s.createdAt).toLocaleString('ko-KR')])];
+async function exportCsv() {
+  let scores;
+  try { scores = await getScores(); } catch { return alert('점수 기록을 불러오지 못했습니다.'); }
+  if (!scores.length) return alert('저장할 기록이 없습니다.');
+  const rows = [['이름','점수','정답수','총문제수','응시일시'], ...scores.map(s => [s.name, s.score, s.correct_count, s.total_questions, new Date(s.created_at).toLocaleString('ko-KR')])];
   const csv = '\uFEFF' + rows.map(row => row.map(value => `"${String(value).replace(/"/g, '""')}"`).join(',')).join('\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' }); const url = URL.createObjectURL(blob); const a = document.createElement('a');
-  a.href = url; a.download = `나트랑_퀴즈2_점수_${new Date().toISOString().slice(0,10)}.csv`; a.click(); URL.revokeObjectURL(url);
+  a.href = url; a.download = `나트랑_퀴즈2_공용점수_${new Date().toISOString().slice(0,10)}.csv`; a.click(); URL.revokeObjectURL(url);
 }
 startForm.addEventListener('submit', e => { e.preventDefault(); if (playerNameInput.value.trim()) startQuiz(playerNameInput.value); });
 prevBtn.addEventListener('click', () => { if (currentIndex > 0) { currentIndex--; renderQuestion(); } });
 nextBtn.addEventListener('click', () => { if (answers[currentIndex] === null) return; if (currentIndex < questions.length - 1) { currentIndex++; renderQuestion(); } else finishQuiz(); });
 reviewBtn.addEventListener('click', () => { reviewSection.classList.toggle('hidden'); reviewBtn.textContent = reviewSection.classList.contains('hidden') ? '오답 확인' : '오답 닫기'; if (!reviewSection.classList.contains('hidden')) reviewSection.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
 restartBtn.addEventListener('click', () => startQuiz(playerName)); exportBtn.addEventListener('click', exportCsv);
-clearBtn.addEventListener('click', () => { if (confirm('2탄 점수 기록을 모두 삭제할까요?')) { localStorage.removeItem('nhaTrangQuiz2Scores'); renderScores(); } });
 renderScores();
